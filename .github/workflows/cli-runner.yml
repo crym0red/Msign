@@ -1,0 +1,310 @@
+name: CLI Runner - Version Diagnostic
+
+run-name: CLI Version Diagnostic ${{ inputs.job_id || github.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      executable:
+        description: Repository-relative executable path
+        required: false
+        default: cli/buddy3
+        type: string
+
+      arguments:
+        description: Arguments passed to the executable
+        required: false
+        default: ''
+        type: string
+
+      platform:
+        description: Diagnostic target label
+        required: false
+        default: iOS
+        type: choice
+        options:
+          - iOS
+          - iPadOS
+          - macOS
+
+      job_id:
+        description: Optional job identifier
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  diagnostic:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Inspect host version
+        shell: bash
+        run: |
+          set -u
+
+          echo "=== Host ==="
+          uname -a
+          uname -m
+          sw_vers
+
+          echo
+          echo "=== Host SystemVersion.plist ==="
+
+          if [ -f /System/Library/CoreServices/SystemVersion.plist ]; then
+            /usr/libexec/PlistBuddy \
+              -c 'Print :ProductVersion' \
+              /System/Library/CoreServices/SystemVersion.plist
+          else
+            echo "Host SystemVersion.plist not found"
+          fi
+
+      - name: Read repository root SystemVersion.plist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Repository root SystemVersion.plist ==="
+
+          if [ ! -f ./SystemVersion.plist ]; then
+            echo "ERROR: ./SystemVersion.plist was not found"
+            exit 1
+          fi
+
+          cat ./SystemVersion.plist
+
+          echo
+          echo "=== Repository ProductVersion ==="
+
+          /usr/libexec/PlistBuddy \
+            -c 'Print :ProductVersion' \
+            ./SystemVersion.plist
+
+      - name: Inspect buddy3 version mechanism
+        shell: bash
+        env:
+          EXECUTABLE: ${{ inputs.executable }}
+        run: |
+          set -u
+
+          test -f "$EXECUTABLE"
+
+          mkdir -p .cli-test
+
+          cp "$EXECUTABLE" .cli-test/buddy3
+          chmod +x .cli-test/buddy3
+
+          echo "=== Mach-O ==="
+
+          file .cli-test/buddy3
+
+          vtool -show-build .cli-test/buddy3 || true
+
+          echo
+          echo "=== Version-related strings ==="
+
+          strings -a .cli-test/buddy3 |
+            grep -Ei \
+              'SystemVersion|ProductVersion|Unsupported iOS version|Unable to determine iOS ProductVersion|buddy_profile_from_product_version|g_buddy_ios_version|15\.4|16\.2|26\.0\.1' \
+              || true
+
+          echo
+          echo "=== Candidate configuration/environment strings ==="
+
+          strings -a .cli-test/buddy3 |
+            grep -Ei \
+              'IOS_VERSION|PRODUCT_VERSION|SYSTEM_VERSION|BUDDY_|VERSION=|--ios|--version|config|configuration|environment' \
+              || true
+
+      - name: Run baseline diagnostic
+        shell: bash
+        env:
+          USER_ARGUMENTS: ${{ inputs.arguments }}
+          JOB_ID: ${{ inputs.job_id }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set +e
+
+          mkdir -p .cli-test
+
+          node <<'NODE'
+          const fs = require('fs');
+          const cp = require('child_process');
+
+          const input = process.env.USER_ARGUMENTS || '';
+
+          function parseShellWords(s) {
+            const out = [];
+            let cur = '';
+            let quote = null;
+            let escape = false;
+
+            for (const ch of s) {
+              if (escape) {
+                cur += ch;
+                escape = false;
+                continue;
+              }
+
+              if (ch === '\\' && quote !== "'") {
+                escape = true;
+                continue;
+              }
+
+              if (quote) {
+                if (ch === quote) {
+                  quote = null;
+                } else {
+                  cur += ch;
+                }
+
+                continue;
+              }
+
+              if (ch === "'" || ch === '"') {
+                quote = ch;
+                continue;
+              }
+
+              if (/\s/.test(ch)) {
+                if (cur.length) {
+                  out.push(cur);
+                  cur = '';
+                }
+              } else {
+                cur += ch;
+              }
+            }
+
+            if (escape) {
+              cur += '\\';
+            }
+
+            if (quote) {
+              throw new Error('Unterminated quote in arguments');
+            }
+
+            if (cur.length) {
+              out.push(cur);
+            }
+
+            return out;
+          }
+
+          let args;
+
+          try {
+            args = parseShellWords(input);
+          } catch (e) {
+            fs.writeFileSync(
+              'cli-result.json',
+              JSON.stringify(
+                {
+                  phase: 'argument-parse',
+                  error: e.message
+                },
+                null,
+                2
+              )
+            );
+
+            process.exit(2);
+          }
+
+          console.log('USER_ARGUMENTS:', input);
+          console.log('arguments:', JSON.stringify(args));
+
+          const start = Date.now();
+
+          const child = cp.spawnSync(
+            './.cli-test/buddy3',
+            args,
+            {
+              env: {
+                ...process.env,
+                JOB_ID: process.env.JOB_ID || '',
+                PLATFORM: process.env.PLATFORM || ''
+              },
+
+              encoding: 'utf8',
+
+              timeout: 540000,
+
+              maxBuffer: 16 * 1024 * 1024
+            }
+          );
+
+          const result = {
+            phase: 'baseline',
+
+            executable: '.cli-test/buddy3',
+
+            arguments: args,
+
+            platform: process.env.PLATFORM || '',
+
+            jobId: process.env.JOB_ID || '',
+
+            exitCode: child.status,
+
+            signal: child.signal,
+
+            timedOut:
+              !!child.error &&
+              child.error.code === 'ETIMEDOUT',
+
+            stdout: child.stdout || '',
+
+            stderr: child.stderr || '',
+
+            error: child.error
+              ? {
+                  code: child.error.code,
+                  message: child.error.message
+                }
+              : null,
+
+            durationMs: Date.now() - start
+          };
+
+          fs.writeFileSync(
+            'cli-result.json',
+            JSON.stringify(result, null, 2)
+          );
+
+          fs.writeFileSync(
+            '.cli-test/stdout.txt',
+            result.stdout
+          );
+
+          fs.writeFileSync(
+            '.cli-test/stderr.txt',
+            result.stderr
+          );
+
+          console.log(
+            JSON.stringify(result, null, 2)
+          );
+
+          // Preserve diagnostic artifacts even when buddy3
+          // exits non-zero or is terminated by the host.
+          process.exit(0);
+          NODE
+
+      - name: Upload diagnostic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buddy3-version-diagnostic-${{ github.run_id }}
+
+          path: |
+            cli-result.json
+            .cli-test/stdout.txt
+            .cli-test/stderr.txt
+            .cli-test/buddy3
+            ./SystemVersion.plist
+
+          if-no-files-found: warn
